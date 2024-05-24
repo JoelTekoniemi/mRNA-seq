@@ -1,0 +1,743 @@
+---
+title: "DESeq2_Ima_Bos_V3"
+author: "Joel"
+date: "2024-05-22"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Differential expression analyses and GSEA
+
+## Changelog
+- V3: Included GSEA analysis in the DESeq2 loop, output enrichment barplots.
+- V2: MA plots use DESeq2 output LFC values instead of calculating them separately.
+- V1: Initial code adapted from CB207V course, looping DESeq2 analysis over all samples.
+
+## Importing packages
+
+```{r}
+library(DESeq2) # Running differential expression
+library(apeglm) 
+library(corrplot) # Creating correlation plots
+library(ggplot2) # Plotting in general, MA plots
+library(factoextra) 
+library(lattice) 
+library(org.Hs.eg.db) # GSEA database search
+library(fgsea) # Running GSEA
+library(tibble) 
+library(dplyr) 
+library(tidyr) # Data handling 
+library(reshape2) 
+library(ComplexHeatmap) # Making heatmaps
+library(circlize) 
+library(VennDiagram)
+library(RColorBrewer)
+```
+
+## Loading in the data into appropriate data structures
+
+### Feature counts
+```{r}
+genelist_filename = "chm13v2_geneList.txt"
+conditions = c("Ima0h", "Ima1h", "Ima6h", "Ima24h", "ImaRec", "Bos0h", "Bos1h", "Bos6h", "Bos24h", "BosRec")
+# the lists below might be redundant, everything should be accessible with conditions.
+featureCount_filenames = c()
+for (condition in conditions){
+  featureCount_filenames = append(featureCount_filenames, paste("featureCounts/", condition, "_BRs_mRNA_featureCounts.txt", sep = ""))
+}
+```
+
+### Genome information
+```{r}
+chm = read.table("chm13v2_geneList.txt", header=T, sep="\t")
+```
+
+### Loading in raw counts
+```{r}
+# open all files and rename the columns, saving each file into raw read data rrd 
+
+# We open the first featurecount file in order to get the length of the genes 
+mRNA_ = read.table(paste("featureCounts/", conditions[1], "_BRs_mRNA_featureCounts.txt", sep = ""), header = T)
+names(mRNA_)=c("geneID", "chr", "txStart", "txEnd", "strand", "length", 
+                 paste("r1", condition[1], sep = "_"),
+                paste("r2", condition[1], sep = "_"),
+                paste("r3", conditions[1], sep = "_"))
+chm = merge(chm, mRNA_[, c("length", "geneID")], by = "geneID")
+TKI_mRNA_rrd = chm
+
+# Loops through all files and adds the reads from each replicate into new columns
+for (condition in conditions){
+  mRNA_ = read.table(paste("featureCounts/", condition, "_BRs_mRNA_featureCounts.txt", sep = ""), header = T)
+  names(mRNA_)=c("geneID", "chr", "txStart", "txEnd", "strand", "length", 
+                 paste("r1", condition, sep = "_"),
+                paste("r2", condition, sep = "_"),
+                paste("r3", condition, sep = "_"))
+  TKI_mRNA_rrd = merge(TKI_mRNA_rrd, mRNA_[ ,
+    c("geneID", 
+      paste("r1", condition, sep = "_"),
+      paste("r2", condition, sep = "_"), 
+      paste("r3", condition, sep = "_"))], by = "geneID")
+}
+```
+
+### Removing duplicates and naming rows
+```{r}
+TKI_mRNA_rrd = TKI_mRNA_rrd[!duplicated(TKI_mRNA_rrd[, c(6, 9:ncol(TKI_mRNA_rrd))]), ]
+rownames(TKI_mRNA_rrd) = make.names(TKI_mRNA_rrd$geneName, unique = TRUE)
+```
+
+## Assessing replicate correlation
+
+Next, we will analyse replicate correlation and identify genes with changed mRNA expression. A common statistic approach for assessing correlation is spearman’s rank correlation. This approach ‘sorts’ or ranks genes based on their expression level (here raw read count on exons) and then compares the order of genes between replicates. If the order is precisely the same, the correlation (rho) becomes 1. The closer to 1, the better the correlation is.
+
+Do we have adequate correlations between replicates? We have very high correlation across the board.
+Why do you think we used the raw counts? We feed in the raw counts to DESeq2
+Should we normalize the counts and do also Pearson’s correlation? Maybe yes!
+
+### Correlation heatmaps
+
+#### All samples together
+```{r}
+pdf("Correlation_plots/Corr_heatmap_TKIs.pdf", width = 9, height = 9, bg = 'white')
+M.TKI = cor(TKI_mRNA_rrd[,10:length(TKI_mRNA_rrd)], method = "spearman")
+corrplot(M.TKI, method = "color", title = "Correlation heatmap of all samples, Spearman correlation",
+         mar=c(0,0,2,0))
+dev.off()
+```
+#### Imatinib and Bosutinib samples separately
+```{r}
+pdf("Correlation_plots/Corr_heatmap_Imatinib.pdf", width = 9, height = 9, bg = 'white')
+Ima_mRNA_rrd = TKI_mRNA_rrd[, grepl("Ima", colnames(TKI_mRNA_rrd))]
+M.Ima = cor(Ima_mRNA_rrd, method = "spearman")
+corrplot(M.Ima, method = "color", title = "Correlation heatmap of Imatinib-treated samples, Spearman correlation",
+         mar=c(0,0,2,0))
+dev.off()
+
+pdf("Correlation_plots/Corr_heatmap_Bosutinib.pdf", width = 9, height = 9, bg = 'white')
+Bos_mRNA_rrd = TKI_mRNA_rrd[, grepl("Bos", colnames(TKI_mRNA_rrd))]
+M.Bos = cor(Bos_mRNA_rrd, method = "spearman")
+corrplot(M.Bos, method = "color", title = "Correlation heatmap of Bosutinib-treated samples, Spearman correlation",
+         mar=c(0,0,2,0))
+dev.off()
+```
+
+### PCA for samples and genes
+
+#### Imatinib
+```{r}
+Ima.df = t(Ima_mRNA_rrd)
+Ima.pca = prcomp(Ima.df, scale = FALSE)
+pdf("Correlation_plots/PCA_Ima_eigenvalues.pdf", width = 7, height = 4, bg = 'white', pointsize = 12)
+fviz_eig(Ima.pca, addlabels = TRUE, title = "Imatinib PCA scree plot") + 
+  ylim(c(0,100))
+dev.off()
+pdf("Correlation_plots/PCA_Ima_samples.pdf", width = 7, height = 4, bg = 'white')
+fviz_pca_ind(Ima.pca,
+             geom = c("point", "text"),
+             col.ind = "cos2", 
+             repel = TRUE,     # Avoid text overlapping
+             title = "Imatinib PCA, samples", 
+             xlab = "PC 1", ylab = "PC 2"
+             ) +
+  scale_color_gradient2(low="white", mid="blue",
+      high="red", midpoint = 0.6)
+  theme_minimal()
+dev.off()
+pdf("Correlation_plots/PCA_Ima_genes.pdf", width = 7, height = 4, bg = 'white')
+fviz_pca_var(Ima.pca,
+             col.var = "cos2", # Color by contributions to the PC,
+             repel = TRUE,     # Avoid text overlapping
+             geom = c("point", "text"),
+             select.var = list(cos2 = 50),
+             title = "Imatinib PCA, genes", 
+             xlab = "PC 1", ylab = "PC 2"
+             ) +
+  scale_color_gradient2(low="white", mid="blue",
+      high="red", midpoint = 4e10)
+  theme_minimal()
+dev.off()
+```
+
+#### Bosutinib
+```{r}
+Bos.df = t(Bos_mRNA_rrd)
+Bos.pca = prcomp(Bos.df, scale = FALSE)
+# summary(Bos.pca)
+pdf("Correlation_plots/PCA_Bos_eigenvalues.pdf", width = 7, height = 4, bg = 'white', pointsize = 12)
+fviz_eig(Bos.pca, addlabels = TRUE, title = "Bosutinib PCA scree plot") + 
+  ylim(c(0,100))
+dev.off()
+pdf("Correlation_plots/PCA_Bos_samples.pdf", width = 7, height = 4, bg = 'white')
+fviz_pca_ind(Bos.pca,
+             geom = c("point", "text"),
+             col.ind = "cos2", 
+             repel = TRUE,     # Avoid text overlapping
+             title = "Bosutinib PCA, samples", 
+             xlab = "PC 1", ylab = "PC 2"
+             ) +
+  scale_color_gradient2(low="white", mid="blue",
+      high="red", midpoint = 0.6) +
+  theme_minimal()
+dev.off()
+pdf("Correlation_plots/PCA_Bos_genes.pdf", width = 7, height = 4, bg = 'white')
+fviz_pca_var(Bos.pca,
+             col.var = "cos2", 
+             repel = TRUE,     # Avoid text overlapping
+             geom = c("point", "text"),
+             select.var = list(cos2 = 50),
+             title = "Bosutinib PCA, genes", 
+             xlab = "PC 1", ylab = "PC 2"
+             ) +
+  scale_color_gradient2(low="white", mid="blue",
+      high="red", midpoint = 6e10) + 
+  theme_minimal()
+dev.off()
+```
+
+#### Imatinib and Bosutinib together
+```{r}
+TKI.df = TKI_mRNA_rrd[, grepl("_", colnames(TKI_mRNA_rrd))]
+TKI.df = t(TKI.df)
+TKI.pca = prcomp(TKI.df, scale = FALSE)
+# summary(TKI.pca)
+pdf("Correlation_plots/PCA_TKI_eigenvalues.pdf", width = 7, height = 4, bg = 'white', pointsize = 12)
+fviz_eig(TKI.pca, addlabels = TRUE, 
+         title = "Imatinib and Bosutinib PCA scree plot") + 
+  ylim(c(0,100))
+dev.off()
+pdf("Correlation_plots/PCA_TKIs_samples.pdf", width = 7, height = 4, bg = 'white')
+fviz_pca_ind(TKI.pca,
+             geom = c("point", "text"),
+             col.ind = "cos2", 
+             repel = TRUE,     # Avoid text overlapping
+             title = "Imatinib and Bosutinib PCA, samples", 
+             xlab = "PC 1", ylab = "PC 2"
+             ) +
+  scale_color_gradient2(low="white", mid="blue",
+      high="red", midpoint = 0.6) + 
+  theme_minimal()
+dev.off()
+pdf("Correlation_plots/PCA_TKIs_genes.pdf", width = 7, height = 4, bg = 'white')
+fviz_pca_var(TKI.pca,
+             col.var = "cos2",
+             repel = TRUE,     # Avoid text overlapping
+             geom = c("point", "text"),
+             select.var = list(cos2 = 50),
+             title = "Imatinib and Bosutinib PCA, genes", 
+             xlab = "PC 1", ylab = "PC 2"
+             ) +
+  scale_color_gradient2(low="white", mid="blue",
+      high="red", midpoint = 6e10) +
+  theme_minimal()
+```
+
+## Differential expression analysis and MA plots
+
+Our replicates seem to correlate well (almost too well...). 
+Next, let’s use DESeq2 (Love et al., 2014) to call genes that have significantly higher (induced) or significantly lower (repressed) mRNA expression after treatment.
+
+### Defining parameters
+
+DESeq2 looks for inherent variability in the samples, and compares the variability between replicates to the variability between the conditions. These variability analyses in fragment count are conducted to each gene (mRNA). In simplicity, if mRNA-seq counts for a gene differ more between hs60 and hs0, that they differ with the replicates, the gene is called differentially expressed. In detail, DESeq2 assigns a p-value for the probability of each gene being differential expression. Below, we load the DESeq2 library and define conditions by which we call a gene differentially expressed. Here, the p-value has to be < 0.01 and the fold change (FC) a minimum of 1.25 (for heat-induced). In the code below, the FC limit for repressed is (1/1.25) = 0.8. The baseMean_Limit is our cutoff for a gene to be expressed. Below this limit, the gene is called unexpressed (unExp).
+
+```{r}
+### These change the parameters for calling significantly induced or repressed
+pVal_Limit = 0.01
+FC_Limit = 1.25
+baseMean_Limit = 10 ## minimum count for calling expression of a gene
+
+### For folder organisation
+output_folder = "DESeq2_output_V3"
+drugs = c("Ima", "Bos")
+cell_line = "K562"
+
+### GSEA Setup
+# Load the pathway (gene set) into a named list
+# downloaded mysigdb were located in my "~" directory:
+pathways.hallmark <- gmtPathways("MSIGDB_geneSets/h.all.v2023.2.Hs.symbols.gmt")
+
+### Colours for plots
+my_colours = RColorBrewer::brewer.pal(4, "Set1")[1:2]
+```
+
+The DESeq2 data matrix has each gene transcript as a row name, followed by:
+- average expression (average read count across all samples)
+- log2FC between timepoint and anchor
+- standard error value (lfcSE) 
+- Wald test on value distribution (stat)
+- P-value
+- Adjusted p-value
+
+## Running DEx analysis with DESeq2
+
+This is a complicated chunk which includes many steps:
+- Creating a results dataframe TKI_mRNA_res
+- Looping through each drug and timepoint 
+- Running DESeq2 by pairwise comapring a timepoint with the 0h control (anchor)
+- Using DESeq2 results for GSEA, based on MSIGDB, with hallmark gene set
+- Creating MA plots --> output as png
+- Saving lists of up-regulated and down-regulated genes --> .txt
+- Output of all DESeq2 results in TKI_mRNA_res data frame
+
+```{r}
+# Taking the first 9 columns of raw read data, which include gene info
+TKI_mRNA_res = TKI_mRNA_rrd[, 1:9]
+
+for (drug in drugs){
+  anchor = c(paste(drug, "0h", sep = "")) # This is what we compare each list element to.
+  
+  # We add the 0h timepoint to the results df.
+  TKI_mRNA_res = merge(TKI_mRNA_res, 
+                       TKI_mRNA_rrd[, c(paste("r1", anchor, sep="_"),
+                                        paste("r2", anchor, sep="_"),
+                                        paste("r3", anchor, sep="_"),
+                                        "refGeneName")], 
+                       by = "refGeneName")
+  
+  ## the total count of mapped read pairs per sample. Used for FPKM normalisation.
+  nfs = read.delim2(paste(drug, "_0h_1h_6h_24h_rec_mRNAseq_nfs.tsv", sep = ""), 
+                    sep = "\t", header = TRUE)
+  row.names(nfs) = nfs$sample
+  
+  # Selects timepoints for each drug that are not the anchor
+  # TestData is a subset of TKI_mRNA_rrd which changes every loop
+  # Each loop adds the results as new columns to TKI_mRNA_res
+  for (timepoint in conditions[grepl(drug, conditions)][conditions[grepl(drug, conditions)] != anchor]){
+    testData = TKI_mRNA_rrd[,c(paste("r1_", anchor, sep = ""), 
+                     paste("r2_", anchor, sep = ""), 
+                     paste("r3_", anchor, sep = ""), 
+                     paste("r1_", timepoint, sep = ""), 
+                     paste("r2_", timepoint, sep = ""), 
+                     paste("r3_", timepoint, sep = ""))]
+    
+    row.names(testData) = TKI_mRNA_rrd$refGeneName # mRNA names as row.names
+    
+    
+    testDesign = data.frame(row.names = colnames(testData), 
+                            condition = as.factor(c(rep(anchor, 3), 
+                                                    rep(timepoint, 3))))
+    
+    # Reads in the testData (raw read counts) and the design (key to the samples)
+    # Creates a DESeqDataSet
+    dds = DESeqDataSetFromMatrix(countData = testData, 
+                                 colData = testDesign, 
+                                 design = ~ condition)
+    
+    # Ensures correct order, anchor first
+    dds$condition = relevel(dds$condition, anchor)
+    
+    # Conducts the DESeq2 analyses
+    DESeq_dds = DESeq(dds) 
+    DESeq2res = results(DESeq_dds)
+    
+    # GSEA ---------------------------------------------------------------------
+    # Here we run GSEA directly from the DESeq2 results:
+    
+    # Start by taking the results object:
+    res2 = data.frame(DESeq2res)
+    res2$refGeneName = rownames(DESeq2res) # Add a column with refGeneName
+    
+    # Convert refGeneName to geneName (Symbol)
+    geneNames = TKI_mRNA_res[, c("refGeneName", "geneName")]
+    res2 = merge(res2, geneNames, by = "refGeneName")
+    
+    res2 = res2[c("geneName", "stat")]
+    res2 = res2 %>%
+      na.omit() %>%
+      group_by(geneName) %>%
+      summarize(stat = mean(stat))
+    
+    # creating  a named vector [ranked genes]
+    ranks = res2$stat
+    names(ranks) = res2$geneName
+    
+    fgseaRes <- fgseaMultilevel(pathways=pathways.hallmark, stats=ranks)
+
+    # Tidy the results:
+    fgseaResTidy <- fgseaRes %>%
+      as_tibble() %>%
+      arrange(desc(NES)) # order by normalized enrichment score (NES)
+    
+    # To see which genes are in each of these pathways:
+    gene.in.pathway = pathways.hallmark %>% 
+      enframe("pathway", "geneName") %>% 
+      unnest(cols = c(geneName)) %>% 
+      inner_join(res2, by="geneName")
+    
+    # Now we clean up the names of the patways
+    fgseaResTidy$pathway = sapply(fgseaResTidy$pathway, strsplit, "_")
+
+    clean_name = function(element){
+      element = element[-1]
+      element = paste(element, collapse = " ")
+      element
+    }
+    
+    fgseaResTidy$pathway = sapply(fgseaResTidy$pathway, clean_name)
+    
+    # Visualisation of GSEA results - Bar plot
+    
+    # Plot the normalized enrichment scores. 
+    # Bar colour is changed depending on if the pathway is induced or repressed.
+    # Coloured bars represent significantly differentially expressed pathways.
+    fgseaResTidy$adjPvalue = "non-significant"
+    
+    fgseaResTidy$adjPvalue = ifelse(fgseaResTidy$padj <= 0.05 & 
+                                      fgseaResTidy$NES > 0, 
+                                     "up-regulated", fgseaResTidy$adjPvalue)
+    
+    fgseaResTidy$adjPvalue = ifelse(fgseaResTidy$padj <= 0.05 & 
+                                      fgseaResTidy$NES < 0, 
+                                    "down-regulated", fgseaResTidy$adjPvalue)
+    
+    cols = c("non-significant" = "grey", 
+              "up-regulated" = my_colours[1], 
+              "down-regulated" = my_colours[2])
+    
+    # Save plot with ggsave
+    GSEA_plot = ggplot(fgseaResTidy, aes(reorder(pathway, NES), NES, 
+                                         fill = adjPvalue)) +
+      geom_col() +
+      scale_fill_manual(values = cols) +
+      theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) +
+      coord_flip() +
+      labs(x="Pathway", 
+           y="Normalized Enrichment Score",
+           title=paste("Hallmark pathways Enrichment Score from GSEA \n",
+                       timepoint, " vs ", anchor, sep = "")) +
+      guides(fill = guide_legend(title="Regulation"))
+    ggsave(paste(output_folder, "/GSEA_plot_", timepoint, "_vs_", anchor, ".pdf", 
+              sep = ""), GSEA_plot, width = 8, height = 10, bg = 'white')
+    
+    # Induced and Repressed genes ----------------------------------------------
+    # Saves the output data from DESeq2 and the shrinkage estimation 
+    write.table(DESeq2res, 
+                file = paste(output_folder, "/", cell_line, "_", timepoint , 
+                             "_against_", anchor, "_mRNAseq_DESeq2output_V3.txt", 
+                             sep = ""), 
+                row.names=T, sep='\t', quote=F, na="")
+    
+    # Reads in the same data we just wrote. See how these (DESeq2res and res) differ
+    # DESeq2res is a DESeq results object while res i a data frame.
+    # For now we take in the LFC data instead of the normal DESeq2res
+    res = read.table(file = paste(output_folder, "/", cell_line, "_", timepoint,
+                                  "_against_", anchor, 
+                                  "_mRNAseq_DESeq2output_V3.txt", sep = ""), 
+                     sep='\t')
+    
+    # Returns the row.names into its own refGeneName column
+    res$refGeneName = row.names(res)
+    
+    # Merges the gene data into the DESeq2 results
+    testData$refGeneName = rownames(testData)
+    testData = merge(chm, testData, by="refGeneName")
+    res = merge(testData, res, by="refGeneName")
+    rownames(res) = res$refGeneName
+    
+    # Calculates the mean of replicates
+    res[,paste(anchor, "mean", sep = "_")] =
+      round(rowMeans(res[, names(res) %in% c(paste("r1_", anchor, sep = ""),
+                                             paste("r2_", anchor, sep = ""),
+                                             paste("r3_", anchor, sep = ""))]),
+            digits=3)
+    res[,paste(timepoint, "mean", sep = "_")] =
+      round(rowMeans(res[, names(res) %in% c(paste("r1_", timepoint, sep = ""),
+                                             paste("r2_", timepoint, sep = ""),
+                                             paste("r3_", timepoint, sep = ""))]),
+            digits=3)
+    
+    # Separates the results into up- and down-regulated based on DESeq2 LFC
+    res$Regulation = "unReg"
+    
+    # Uses DESeq2 LFC estimate to separate induced and repressed genes
+    res$Regulation = ifelse(res$padj<pVal_Limit &
+                              res$log2FoldChange>log2(FC_Limit),
+                            "UpHC", res$Regulation)
+
+    res$Regulation = ifelse(res$padj<pVal_Limit &
+                              res$log2FoldChange<log2(1/FC_Limit),
+                            "DownHC", res$Regulation)
+
+    res$Regulation = ifelse(res$baseMean<baseMean_Limit, "unExp",
+                            res$Regulation)
+
+    # Having too many digits is confusing, these steps clean the values to 3 digits.
+    res$pvalue = round(res$pvalue, digits=3)
+    res$padj = round(res$padj, digits=3)
+
+    # Normalising against the sequencing depth
+    # Multiplies the mean by 1 000 000 and divide by total mapped reads (from nfs)
+
+    res[,paste(anchor, "FPM", sep = "_")] =
+      res[,paste(anchor, "mean", sep = "_")] * 1000000 /
+      (sum(as.numeric(nfs[paste("R1", anchor, sep = ""),"total_mapping"]),
+           as.numeric(nfs[paste("R2", anchor, sep = ""),"total_mapping"]),
+           as.numeric(nfs[paste("R3", anchor, sep = ""),"total_mapping"]),
+           digits = 3))
+
+    res[,paste(timepoint, "FPM", sep = "_")] =
+      res[,paste(timepoint, "mean", sep = "_")] * 1000000 /
+      (sum(as.numeric(nfs[paste("R1", timepoint, sep = ""),"total_mapping"]),
+           as.numeric(nfs[paste("R2", timepoint, sep = ""),"total_mapping"]),
+           as.numeric(nfs[paste("R3", timepoint, sep = ""),"total_mapping"]),
+           digits = 3))
+
+    # Taking into account the mRNA length.
+    res[,paste(anchor, "FPKM", sep = "_")] = 
+      round(res[, paste(anchor, "FPM", sep = "_")] / res$length * 1000,
+            digits = 3)
+
+    res[,paste(timepoint, "FPKM", sep = "_")] = 
+      round(res[, paste(timepoint, "FPM", sep = "_")] / res$length * 1000,
+            digits = 3)
+
+    res$FC = round(res[,paste(timepoint, "FPKM", sep = "_")] /
+                     res[, paste(anchor, "FPKM", sep = "_")],
+                   digits = 3)
+
+    res$log2FC = round((log2(res[, paste(timepoint, "FPKM", sep = "_")]) -
+                           log2(res[, paste(anchor, "FPKM", sep = "_")])), 
+                       digits = 3)
+
+    res$dFPKM = round(res[, paste(timepoint, "FPKM", sep = "_")] -
+                        res[, paste(anchor, "FPKM", sep = "_")],
+                   digits = 3)
+    
+    induced = subset(res, Regulation == "UpHC")
+
+    repressed = subset(res, Regulation == "DownHC")
+
+    # Ordering the list based on a value in a selected column.
+    # Note how we use minus (-) to order from the largest to smallest value.
+    induced = induced[order(-induced$dFPKM), ]
+    repressed = repressed[order(repressed$dFPKM), ]
+
+    # Rename the rows of induced and repressed data frames for saving
+    rownames(induced) = induced$refGeneName
+    rownames(repressed) = repressed$refGeneName
+
+    # This loop changes the column names of res to include the time point, except
+    # refGeneName since that column is constant
+    for (name in colnames(res)[colnames(res) %in% c("pvalue", "padj",
+                                                    "Regulation", "FC", "log2FC",
+                                                    "dFPKM")]){
+      colnames(res)[colnames(res) == name] = paste(name, timepoint, "vs", anchor, sep = "_")
+    }
+    
+    write.table(induced, file = paste("geneLists_V2/Induced_mRNAs_", timepoint, "_vs_",
+                                      anchor, ".tsv", sep = ""), sep = "\t")
+    write.table(repressed, file = paste("geneLists_V2/Repressed_mRNAs_", timepoint, "_vs_",
+                                        anchor, ".tsv", sep = ""), sep = "\t")
+
+    # We merge the results in res into the TKI_mRNA_res data frame
+    TKI_mRNA_res = cbind(TKI_mRNA_res, res[,c(
+      paste("r1", timepoint, sep = "_"),
+      paste("r2", timepoint, sep = "_"),
+      paste("r3", timepoint, sep = "_"),
+      paste("pvalue", timepoint, "vs", anchor, sep = "_"), 
+      paste("padj", timepoint, "vs", anchor, sep = "_"),
+      paste("Regulation", timepoint, "vs", anchor, sep = "_"), 
+      paste("FC", timepoint, "vs", anchor, sep = "_"), 
+      paste("log2FC", timepoint, "vs", anchor, sep = "_"),
+      paste("dFPKM", timepoint, "vs", anchor, sep = "_")
+    )])
+
+    pdf(paste("MA_plots_V3/MA_plot_", timepoint, "_vs_", anchor, ".pdf", sep = ""),
+        width = 14, height = 8, bg = 'white')
+    par(font.axis = 2)
+    par(font.lab = 2)
+    par(cex.lab = 1.3)
+    par(cex.axis = 1.3)
+    par(cex = 2)
+    par(cex.main = 1.5)
+    par(mar = c(5,5,4,1))
+
+    # MA Plot using own Log2 Fold change values calculated from means.
+    plot((log2(res[,paste(timepoint, "mean", sep="_")] *
+                 res[,paste(anchor, "mean", sep="_")])) / 2,
+         res$log2FoldChange,
+         main = paste('Significantly Changed mRNAs', timepoint, "vs", anchor),
+         xlab = 'Average Log2 Expression',
+         ylab = 'Log2FC',
+         col = 'grey40',
+         cex = 0.9,
+         ylim = c(-10,10),
+         xlim = c(-5,20))
+
+    points(x = (log2(induced[, paste(timepoint, "mean", sep="_")] *
+                   induced[, paste(anchor, "mean", sep="_")])) / 2,
+           y = induced$log2FoldChange,
+           col = my_colours[1],
+           pch = 20,
+           cex = 0.8)
+
+    points(x = (log2(repressed[, paste(timepoint, "mean", sep="_")] *
+                   repressed[, paste(anchor, "mean", sep="_")])) / 2,
+           y = repressed$log2FoldChange,
+           col = my_colours[2],
+           pch = 20,
+           cex = 0.8)
+    
+    par(font = 2)
+
+    legend("topright",
+           legend = paste("Up = ", nrow(induced), sep=""),
+         col = my_colours[1],
+         cex = 1,
+         bty = "n")
+
+    legend("bottomright",
+         legend = paste("Down = ", nrow(repressed), sep = ""),
+         col = my_colours[2],
+         cex = 1,
+         bty = "n")
+
+    dev.off()
+    
+    }
+  
+}
+```
+```{r}
+GSEA_plot = ggplot(fgseaResTidy, aes(reorder(pathway, NES), NES, fill = adjPvalue)) +
+  geom_col() +
+  scale_fill_manual(values = cols) +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) +
+  coord_flip() +
+  labs(x="Pathway", 
+       y="Normalized Enrichment Score",
+       title=paste("Hallmark pathways Enrichment Score from GSEA \n",
+                   timepoint, " vs ", anchor, sep = ""))
+ggsave(paste(output_folder, "/GSEA_plot_", timepoint, "_vs_", anchor, ".pdf", 
+          sep = ""), GSEA_plot, width = 8, height = 10, bg = 'white')
+```
+
+### Venn Diagrams of up- and down-regulated genes
+
+```{r}
+Ima1hinduced = rownames(read.delim("geneLists_V2/Induced_mRNAs_Ima1h_vs_Ima0h.tsv", sep = "\t"))
+Ima6hinduced = rownames(read.delim("geneLists_V2/Induced_mRNAs_Ima6h_vs_Ima0h.tsv", sep = "\t"))
+Ima24hinduced = rownames(read.delim("geneLists_V2/Induced_mRNAs_Ima24h_vs_Ima0h.tsv", sep = "\t"))
+ImaRecinduced = rownames(read.delim("geneLists_V2/Induced_mRNAs_ImaRec_vs_Ima0h.tsv", sep = "\t"))
+Ima1hrepressed = rownames(read.delim("geneLists_V2/Repressed_mRNAs_Ima1h_vs_Ima0h.tsv", sep = "\t"))
+Ima6hrepressed = rownames(read.delim("geneLists_V2/Repressed_mRNAs_Ima6h_vs_Ima0h.tsv", sep = "\t"))
+Ima24hrepressed = rownames(read.delim("geneLists_V2/Repressed_mRNAs_Ima24h_vs_Ima0h.tsv", sep = "\t"))
+ImaRecrepressed = rownames(read.delim("geneLists_V2/Repressed_mRNAs_ImaRec_vs_Ima0h.tsv", sep = "\t"))
+Bos1hinduced = rownames(read.delim("geneLists_V2/Induced_mRNAs_Bos1h_vs_Bos0h.tsv", sep = "\t"))
+Bos6hinduced = rownames(read.delim("geneLists_V2/Induced_mRNAs_Bos6h_vs_Bos0h.tsv", sep = "\t"))
+Bos24hinduced = rownames(read.delim("geneLists_V2/Induced_mRNAs_Bos24h_vs_Bos0h.tsv", sep = "\t"))
+BosRecinduced = rownames(read.delim("geneLists_V2/Induced_mRNAs_BosRec_vs_Bos0h.tsv", sep = "\t"))
+Bos1hrepressed = rownames(read.delim("geneLists_V2/Repressed_mRNAs_Bos1h_vs_Bos0h.tsv", sep = "\t"))
+Bos6hrepressed = rownames(read.delim("geneLists_V2/Repressed_mRNAs_Bos6h_vs_Bos0h.tsv", sep = "\t"))
+Bos24hrepressed = rownames(read.delim("geneLists_V2/Repressed_mRNAs_Bos24h_vs_Bos0h.tsv", sep = "\t"))
+BosRecrepressed = rownames(read.delim("geneLists_V2/Repressed_mRNAs_BosRec_vs_Bos0h.tsv", sep = "\t"))
+
+my_colours2 = brewer.pal(4, "Pastel2")
+venn.diagram(x = list(Bos1h = Bos1hinduced, Bos6h = Bos6hinduced, Bos24h = Bos24hinduced, BosRec = BosRecinduced),
+             filename = "Bosutinib_induced.png",
+             output = TRUE,
+             imagetype="png",
+             height = 1000, 
+             width = 1000, 
+             resolution = 300,
+             # Circles
+             lwd = 2,
+             lty = 'blank',
+             fill = my_colours2,
+             # Numbers
+             cex = .6,
+             fontface = "bold",
+             fontfamily = "sans")
+
+venn.diagram(x = list(Bos1h = Bos1hrepressed, Bos6h = Bos6hrepressed, Bos24h = Bos24hrepressed, BosRec = BosRecrepressed),
+             filename = "Bosutinib_repressed.png",
+             output = TRUE,
+             imagetype="png",
+             height = 1000, 
+             width = 1000, 
+             resolution = 300,
+             # Circles
+             lwd = 2,
+             lty = 'blank',
+             fill = my_colours2,
+             # Numbers
+             cex = .6,
+             fontface = "bold",
+             fontfamily = "sans")
+
+venn.diagram(x = list(Ima1h = Ima1hinduced, Ima6h = Ima6hinduced, Ima24h = Ima24hinduced, ImaRec = ImaRecinduced),
+             filename = "Imatinib_induced.png",
+             output = TRUE,
+             imagetype="png",
+             height = 1000, 
+             width = 1000, 
+             resolution = 300,
+             # Circles
+             lwd = 2,
+             lty = 'blank',
+             fill = my_colours2,
+             # Numbers
+             cex = .6,
+             fontface = "bold",
+             fontfamily = "sans")
+
+venn.diagram(x = list(Ima1h = Ima1hrepressed, Ima6h = Ima6hrepressed, Ima24h = Ima24hrepressed, ImaRec = ImaRecrepressed),
+             filename = "Imatinib_repressed.png",
+             output = TRUE,
+             imagetype="png",
+             height = 1000, 
+             width = 1000, 
+             resolution = 300,
+             # Circles
+             lwd = 2,
+             lty = 'blank',
+             fill = my_colours2,
+             # Numbers
+             cex = .6,
+             fontface = "bold",
+             fontfamily = "sans")
+
+# Here we compare induced and repressed genes across all timepoint between drugs
+ImaInduced = c(Ima1hinduced, Ima6hinduced, Ima24hinduced, ImaRecinduced)
+ImaRepressed = c(Ima1hrepressed, Ima6hrepressed, Ima24hrepressed, ImaRecrepressed)
+BosInduced = c(Bos1hinduced, Bos6hinduced, Bos24hinduced, BosRecinduced)
+BosRepressed = c(Bos1hrepressed, Bos6hrepressed, Bos24hrepressed, BosRecrepressed)
+
+venn.diagram(x = list("Imatinib\ninduced" = ImaInduced, "Imatinib\nrepressed" = ImaRepressed, "Bosutinib\ninduced" = BosInduced, "Bosutinib\nrepressed" = BosRepressed),
+             filename = "TKI_venn.png",
+             output = TRUE,
+             imagetype="png",
+             height = 1000, 
+             width = 1000, 
+             resolution = 300,
+             force.unique = TRUE, 
+             disable.logging = TRUE,
+             # Circles
+             lwd = 2,
+             lty = 'blank',
+             fill = my_colours2,
+             # Numbers
+             cex = .6,
+             fontface = "bold",
+             fontfamily = "sans", 
+             # Names
+             cat.cex = .8)
+
+```
+
+
+#### Looking at the p-value distributions
+
+```{r}
+res$significant = ifelse(res$padj_BosRec_vs_Bos0h < 0.05, "p < 0.05", "p ≥ 0.05")
+ggplot(data = res, mapping = aes(x = padj_BosRec_vs_Bos0h, fill = significant)) + 
+  geom_histogram(binwidth = 0.01, colour = "white", linewidth = 0.2, center = 0, closed = "left") +
+  ylim(0, 1500) +
+  scale_fill_manual(values=c("black", "gray")) + 
+  theme_minimal()
+```
+
+
